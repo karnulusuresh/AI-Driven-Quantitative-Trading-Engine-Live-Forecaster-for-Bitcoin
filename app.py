@@ -37,7 +37,7 @@ except FileNotFoundError:
 @st.cache_data(ttl=3600)
 def build_market_dataset():
     # Load 3 years of historic data to support backtest visualization
-    data = yf.download("BTC-USD", period="3y", interval="1d")
+    data = yf.download("BTC-USD", period="3y", interval="1d", multilevel_index=False)
     df = data[['Close', 'Volume']].copy()
     
     # Structural calculations
