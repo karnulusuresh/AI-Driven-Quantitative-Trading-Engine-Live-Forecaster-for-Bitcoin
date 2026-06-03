@@ -14,17 +14,11 @@ st.title("₿ Bitcoin Quant Trading Engine & Live Forecaster")
 # 1. Pipeline Artifact Loader
 @st.cache_resource
 def load_production_artifacts():
-    # 1. Load the RobustScaler
     with open('models/scaler.pkl', 'rb') as f:
         scaler = pickle.load(f)
-    
-    # 2. Load the Classifier via pickle (Restores wrapper state perfectly)
     with open('models/classifier.pkl', 'rb') as f:
         clf = pickle.load(f)
-    
-    # 3. Load the Keras LSTM Regressor
     reg = load_model('models/regressor_lstm.h5')
-    
     return scaler, clf, reg
 
 try:
@@ -33,11 +27,26 @@ except FileNotFoundError:
     st.error("⚠️ Model files missing. Please ensure your saved weights exist in the 'models/' folder structure.")
     st.stop()
 
-# 2. Optimized Live Data Pipeline
+# 2. Optimized Live Data Pipeline (FIXED FOR MULTI-INDEX)
 @st.cache_data(ttl=3600)
 def build_market_dataset():
-    # Load 3 years of historic data to support backtest visualization
-    data = yf.download("BTC-USD", period="3y", interval="1d", multi_level_index=False)
+    # Force auto_adjust and explicitly prevent multi-level indexes
+    data = yf.download("BTC-USD", period="3y", interval="1d", auto_adjust=True)
+    
+    # Safety Check: Did yfinance return any data?
+    if data.empty:
+        return pd.DataFrame()
+        
+    # Flatten columns if yfinance returned a multi-index anyway
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [col[0] if isinstance(col, tuple) else col for col in data.columns]
+    
+    # Ensure standard casing for columns
+    data.columns = [c.capitalize() for c in data.columns]
+    
+    if 'Close' not in data.columns or 'Volume' not in data.columns:
+        return pd.DataFrame()
+
     df = data[['Close', 'Volume']].copy()
     
     # Structural calculations
@@ -51,6 +60,11 @@ def build_market_dataset():
     return df.dropna().copy()
 
 df_market = build_market_dataset()
+
+# 🛑 SAFETY CHECK 1: Global App Halt if Data Pipeline Fails
+if df_market.empty or len(df_market) < 15:
+    st.error("🚨 Failed to fetch market data from API or dataset is too small to calculate rolling features. Please refresh.")
+    st.stop()
 
 # 3. Dynamic Strategy Backtester Matrix
 @st.cache_data
@@ -68,20 +82,21 @@ def run_strategy_backtest(_df, split_percent=0.8):
     
     # Process test data
     X_test = X.iloc[split_idx:]
+    
+    # 🛑 SAFETY CHECK 2: Prevent RobustScaler from crashing on empty test split
+    if X_test.empty or X_test.shape[0] == 0:
+        return pd.DataFrame()
+        
     test_dates = _df.index[split_idx:]
     actual_returns = _df['Log_Returns'].iloc[split_idx:].values
     
     X_test_scaled = scaler.transform(X_test)
-    
-    # Extract prediction matrices
     y_pred_class = classifier.predict(X_test_scaled)
     
-    # Reconstruct 3D windows for LSTM over test set
     def build_test_windows(data_scaled, lookback=10):
         windows = []
         for i in range(len(data_scaled)):
             if i < lookback:
-                # Pad early test entries with historical context if needed
                 pad_needed = lookback - (i + 1)
                 window = np.vstack([data_scaled[0:1]] * pad_needed + [data_scaled[0:i+1]])
             else:
@@ -92,15 +107,12 @@ def run_strategy_backtest(_df, split_percent=0.8):
     X_test_3d = build_test_windows(X_test_scaled)
     y_pred_lstm = lstm_regressor.predict(X_test_3d).flatten()
     
-    # Build tracking frame
     bt_df = pd.DataFrame(index=test_dates)
     bt_df['BTC_Return'] = actual_returns
     bt_df['CLF_Signal'] = y_pred_class
     bt_df['LSTM_Return_Pred'] = y_pred_lstm
     
-    # Combined Ensemble Logic: Buy only if Classifier says UP AND LSTM forecasts positive return
     bt_df['Ensemble_Signal'] = np.where((bt_df['CLF_Signal'] == 1) & (bt_df['LSTM_Return_Pred'] > 0.005), 1, 0)
-    
     bt_df['Strat_Return'] = bt_df['Ensemble_Signal'] * bt_df['BTC_Return']
     
     bt_df['Cum_BTC'] = np.exp(bt_df['BTC_Return'].cumsum()) * 10000
@@ -109,6 +121,11 @@ def run_strategy_backtest(_df, split_percent=0.8):
 
 bt_results = run_strategy_backtest(df_market)
 
+# 🛑 SAFETY CHECK 3: Verify backtest results generated data
+if bt_results.empty:
+    st.warning("⚠️ Backtest split resulted in 0 samples. Increase your historical dataset window or decrease your split percentage.")
+    st.stop()
+
 # 4. Live Forward Signals Module
 features = [
     'Log_Returns', 'Log_Returns_Lag_2', 'Volume_Lag_1', 
@@ -116,14 +133,19 @@ features = [
     'Log_Returns_Lag_1', 'Volume_Lag_3'
 ]
 
-last_10_days = df_market[features].tail(10)
-scaled_input_2d = scaler.transform(last_10_days)
-current_day_flat = scaled_input_2d[-1].reshape(1, -1)
-current_window_3d = scaled_input_2d.reshape(1, 10, 8)
+# Ensure we have at least 10 entries for the window
+if len(df_market) >= 10:
+    last_10_days = df_market[features].tail(10)
+    scaled_input_2d = scaler.transform(last_10_days)
+    current_day_flat = scaled_input_2d[-1].reshape(1, -1)
+    current_window_3d = scaled_input_2d.reshape(1, 10, 8)
 
-live_direction = classifier.predict(current_day_flat)[0]
-live_confidence = classifier.predict_proba(current_day_flat)[0]
-live_lstm_return = lstm_regressor.predict(current_window_3d)[0][0]
+    live_direction = classifier.predict(current_day_flat)[0]
+    live_confidence = classifier.predict_proba(current_day_flat)[0]
+    live_lstm_return = lstm_regressor.predict(current_window_3d)[0][0]
+else:
+    st.error("🚨 Insufficient market history to construct live features.")
+    st.stop()
 
 # --- UI PRESENTATION LAYER ---
 st.subheader("💡 Live Market Inferences (Tomorrow's Forecast)")
