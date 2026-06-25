@@ -112,14 +112,106 @@ def run_strategy_backtest(_df, split_percent=0.8):
     bt_df['CLF_Signal'] = y_pred_class
     bt_df['LSTM_Return_Pred'] = y_pred_lstm
     
-    bt_df['Ensemble_Signal'] = np.where((bt_df['CLF_Signal'] == 1) & (bt_df['LSTM_Return_Pred'] > 0.005), 1, 0)
-    bt_df['Strat_Return'] = bt_df['Ensemble_Signal'] * bt_df['BTC_Return']
+    # XGBoost probabilities
+    proba = classifier.predict_proba(X_test_scaled)
+    bt_df['UP_Prob'] = proba[:, 1]
+
+    # Position sizing
+    bt_df['Position_Size'] = np.where( bt_df['UP_Prob'] > 0.50, 1.0, 0 )
+
+    # Ensemble filter
+    bt_df['Ensemble_Signal'] = np.where(
+        (bt_df['Position_Size'] > 0) &
+        (bt_df['LSTM_Return_Pred'] > 0),
+        bt_df['Position_Size'],
+        0
+    )
+
+    # Transaction costs
+    TRANSACTION_COST = 0.001
+
+    bt_df['Position_Change'] = (
+        bt_df['Ensemble_Signal']
+        .diff()
+        .abs()
+        .fillna(0)
+        )
+
+    bt_df['Cost'] = (
+        bt_df['Position_Change']
+        * TRANSACTION_COST
+    )
+
+    bt_df['Strat_Return'] = (
+        bt_df['Ensemble_Signal']
+        * bt_df['BTC_Return']
+    ) - bt_df['Cost']
     
     bt_df['Cum_BTC'] = np.exp(bt_df['BTC_Return'].cumsum()) * 10000
     bt_df['Cum_Strat'] = np.exp(bt_df['Strat_Return'].cumsum()) * 10000
     return bt_df
 
 bt_results = run_strategy_backtest(df_market)
+
+st.subheader("Debug Statistics")
+
+st.write("UP Probability")
+st.write(bt_results["UP_Prob"].describe())
+
+st.write("LSTM Predictions")
+st.write(bt_results["LSTM_Return_Pred"].describe())
+
+st.write("Signal Counts")
+st.write(bt_results['Ensemble_Signal'].value_counts())
+
+strategy_returns = bt_results['Strat_Return']
+
+# Sharpe Ratio
+if strategy_returns.std() != 0:
+    sharpe_ratio = (
+        strategy_returns.mean()
+        / strategy_returns.std()
+    ) * np.sqrt(252)
+else:
+    sharpe_ratio = 0
+
+# CAGR
+years = len(bt_results) / 252
+
+if years > 0:
+    cagr = (
+        (bt_results['Cum_Strat'].iloc[-1] / 10000)
+        ** (1 / years) - 1
+    ) * 100
+else:
+    cagr = 0
+
+# Drawdown
+rolling_max = bt_results['Cum_Strat'].cummax()
+
+drawdown = (
+    bt_results['Cum_Strat']
+    - rolling_max
+) / rolling_max
+
+max_drawdown = drawdown.min() * 100
+
+# Win Rate
+trade_days = bt_results[
+    bt_results['Ensemble_Signal'] > 0
+]
+
+if len(trade_days) > 0:
+    win_rate = (
+        (trade_days['BTC_Return'] > 0).sum()
+        / len(trade_days)
+    ) * 100
+else:
+    win_rate = 0
+
+num_trades = (
+    bt_results['Position_Change'] > 0
+).sum()
 
 # 🛑 SAFETY CHECK 3: Verify backtest results generated data
 if bt_results.empty:
@@ -172,6 +264,30 @@ with m3:
 st.markdown("---")
 st.subheader("📊 Out-of-Sample Historical Strategy Performance")
 
+st.subheader("📈 Professional Risk Metrics")
+
+r1, r2, r3, r4 = st.columns(4)
+
+r1.metric(
+    "Sharpe Ratio",
+    f"{sharpe_ratio:.2f}"
+)
+
+r2.metric(
+    "Max Drawdown",
+    f"{max_drawdown:.2f}%"
+)
+
+r3.metric(
+    "CAGR",
+    f"{cagr:.2f}%"
+)
+
+r4.metric(
+    "Win Rate",
+    f"{win_rate:.1f}%"
+)
+
 col_metric_1, col_metric_2 = st.columns(2)
 final_btc_roi = (bt_results['Cum_BTC'].iloc[-1] / 10000 - 1) * 100
 final_strat_roi = (bt_results['Cum_Strat'].iloc[-1] / 10000 - 1) * 100
@@ -184,6 +300,14 @@ fig = go.Figure()
 fig.add_trace(go.Scatter(x=bt_results.index, y=bt_results['Cum_BTC'], name='Buy & Hold BTC', line=dict(color='#FF9900', width=2)))
 fig.add_trace(go.Scatter(x=bt_results.index, y=bt_results['Cum_Strat'], name='Ensemble AI Strategy', line=dict(color='#00FFCC', width=2.5)))
 
+buy_signals = bt_results[
+    bt_results['Position_Change'] > 0
+]
+
+sell_signals = bt_results[
+    bt_results['Position_Change'] < 0
+]
+
 fig.update_layout(
     title='Growth of $10,000 Investment (Simulation Run Over Test Window)',
     xaxis_title='Timeline',
@@ -192,3 +316,4 @@ fig.update_layout(
     legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
 )
 st.plotly_chart(fig, use_container_width=True)
+  
